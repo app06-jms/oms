@@ -1,0 +1,144 @@
+import { useCallback, useEffect, useMemo, useState } from 'react';
+import { fetchAttendanceHistory } from '@/features/attendance/attendanceService';
+import type { AttendanceRecord } from '@/features/attendance/attendanceRules';
+import {
+  applyClosingFilters,
+  buildClosingKpis,
+  buildClosingRows,
+  buildLockSnapshots,
+  getPeriodRange,
+  type ClosingFilters,
+  type ClosingRow,
+} from '@/features/closing/closingRules';
+import {
+  decideAdjustment,
+  decideOvertime,
+  fetchLockedSummaries,
+  fetchPayrollAdjustments,
+  fetchPayrollPeriod,
+  lockPeriod,
+  requestAdjustment,
+  saveDeadline,
+  type LockedSummary,
+  type PayrollPeriod,
+} from '@/features/closing/closingService';
+import { fetchEmployees, fetchSchedules } from '@/features/schedule/scheduleService';
+import type { Employee, ScheduleEntry } from '@/features/schedule/scheduleRules';
+
+const RECONCILING: PayrollPeriod = { status: 'reconciling', deadline: null, lockedAt: null };
+
+interface PeriodData {
+  records: AttendanceRecord[];
+  employees: Employee[];
+  schedules: ScheduleEntry[];
+  period: PayrollPeriod;
+  summaries: LockedSummary[];
+  rows: ClosingRow[];
+}
+
+export function useClosing(period: string, filters: ClosingFilters) {
+  const [data, setData] = useState<PeriodData | null>(null);
+  const [isLoading, setIsLoading] = useState(true);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
+  const [busyKey, setBusyKey] = useState<string | null>(null);
+
+  const refresh = useCallback(async () => {
+    setIsLoading(true);
+    const range = getPeriodRange(period);
+    try {
+      const [records, employees, schedules, adjustments, payrollPeriod, summaries] = await Promise.all([
+        fetchAttendanceHistory(null, range),
+        fetchEmployees(),
+        fetchSchedules(range.from ?? period, range.to ?? period),
+        fetchPayrollAdjustments(range.from ?? period, range.to ?? period),
+        fetchPayrollPeriod(period),
+        fetchLockedSummaries(period),
+      ]);
+      setData({
+        records,
+        employees,
+        schedules,
+        period: payrollPeriod ?? RECONCILING,
+        summaries,
+        rows: buildClosingRows(records, employees, adjustments),
+      });
+      setLoadError(null);
+    } catch {
+      setLoadError('Không thể tải dữ liệu chốt công. Vui lòng thử lại.');
+    } finally {
+      setIsLoading(false);
+    }
+  }, [period]);
+
+  useEffect(() => {
+    void refresh();
+  }, [refresh]);
+
+  const fullKpis = useMemo(
+    () => (data ? buildClosingKpis(data.rows, data.schedules) : null),
+    [data]
+  );
+
+  const visible = useMemo(
+    () => (data ? applyClosingFilters(data.rows, data.schedules, data.employees, filters) : null),
+    [data, filters]
+  );
+
+  const kpis = useMemo(
+    () => (visible ? buildClosingKpis(visible.rows, visible.schedules) : null),
+    [visible]
+  );
+
+  const isLocked = data?.period.status === 'locked';
+  const blockerCount = (fullKpis?.pendingOtCount ?? 0) + (fullKpis?.pendingAdjustmentCount ?? 0);
+
+  async function run(key: string, action: () => Promise<void>): Promise<boolean> {
+    setBusyKey(key);
+    setActionError(null);
+    try {
+      await action();
+      await refresh();
+      return true;
+    } catch (error) {
+      setActionError(readableError(error));
+      return false;
+    } finally {
+      setBusyKey(null);
+    }
+  }
+
+  return {
+    rows: visible?.rows ?? [],
+    totalRowCount: data?.rows.length ?? 0,
+    kpis,
+    summaries: data?.summaries ?? [],
+    period: data?.period ?? RECONCILING,
+    isLocked: Boolean(isLocked),
+    isLoading,
+    loadError,
+    actionError,
+    busyKey,
+    blockerCount,
+    canLock: blockerCount === 0 && fullKpis !== null,
+    setDeadline: (deadline: string | null) => run('deadline', () => saveDeadline(period, deadline)),
+    decideOvertime: (recordId: string, decision: 'approved' | 'rejected') =>
+      run(`ot-${recordId}`, () => decideOvertime(recordId, decision)),
+    requestAdjustment: (recordId: string, checkInAt: string, checkOutAt: string | null, reason: string) =>
+      run(`request-${recordId}`, () => requestAdjustment(recordId, checkInAt, checkOutAt, reason)),
+    decideAdjustment: (adjustmentId: string, decision: 'approved' | 'rejected') =>
+      run(`adjustment-${adjustmentId}`, () => decideAdjustment(adjustmentId, decision)),
+    lock: () => {
+      if (!data) return Promise.resolve(false);
+      const snapshots = buildLockSnapshots(data.employees, data.rows, data.schedules);
+      return run('lock', () => lockPeriod(period, snapshots));
+    },
+  };
+}
+
+function readableError(error: unknown): string {
+  if (typeof error === 'object' && error !== null && 'message' in error && typeof error.message === 'string') {
+    return error.message;
+  }
+  return 'Có lỗi xảy ra. Vui lòng thử lại.';
+}
